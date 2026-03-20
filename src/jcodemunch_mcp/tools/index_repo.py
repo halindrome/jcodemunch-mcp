@@ -1,16 +1,19 @@
 """Index repository tool - fetch, parse, summarize, save."""
 
 import asyncio
+import hashlib
 import os
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 
+from collections import defaultdict
+
 from ..parser import parse_file, LANGUAGE_EXTENSIONS
-from ..security import is_secret_file, is_binary_extension
+from ..security import is_secret_file, is_binary_extension, get_max_index_files
 from ..storage import IndexStore
-from ..summarizer import summarize_symbols
+from ..summarizer import summarize_symbols, generate_file_summaries
 
 
 # File patterns to skip
@@ -77,18 +80,25 @@ async def fetch_repo_tree(owner: str, repo: str, token: Optional[str] = None) ->
 
 def should_skip_file(path: str) -> bool:
     """Check if file should be skipped based on path patterns."""
+    normalized = path.replace("\\", "/")
     for pattern in SKIP_PATTERNS:
-        if pattern in path:
-            return True
+        if pattern.endswith("/"):
+            # Directory pattern: match only complete path segments to avoid
+            # false positives on names like "rebuild/" or "proto-utils/"
+            if normalized.startswith(pattern) or ("/" + pattern) in normalized:
+                return True
+        else:
+            if pattern in normalized:
+                return True
     return False
 
 
 def discover_source_files(
     tree_entries: list[dict],
     gitignore_content: Optional[str] = None,
-    max_files: int = 500,
+    max_files: Optional[int] = None,
     max_size: int = 500 * 1024  # 500KB
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Discover source files from tree entries.
     
     Applies filtering pipeline:
@@ -100,6 +110,8 @@ def discover_source_files(
     6. File count limit
     """
     import pathspec
+
+    max_files = get_max_index_files(max_files)
     
     # Parse gitignore if provided
     gitignore_spec = None
@@ -149,8 +161,10 @@ def discover_source_files(
         
         files.append(path)
     
+    truncated = len(files) > max_files
+
     # File count limit with prioritization
-    if len(files) > max_files:
+    if truncated:
         # Prioritize: src/, lib/, pkg/, cmd/, internal/ first
         priority_dirs = ["src/", "lib/", "pkg/", "cmd/", "internal/"]
         
@@ -165,7 +179,7 @@ def discover_source_files(
         files.sort(key=priority_key)
         files = files[:max_files]
     
-    return files
+    return files, truncated
 
 
 async def fetch_file_content(
@@ -228,6 +242,7 @@ async def index_repo(
         github_token = os.environ.get("GITHUB_TOKEN")
     
     warnings = []
+    max_files = get_max_index_files()
     
     try:
         # Fetch tree
@@ -244,7 +259,11 @@ async def index_repo(
         gitignore_content = await fetch_gitignore(owner, repo, github_token)
         
         # Discover source files
-        source_files = discover_source_files(tree_entries, gitignore_content)
+        source_files, truncated = discover_source_files(
+            tree_entries,
+            gitignore_content,
+            max_files=max_files,
+        )
         
         if not source_files:
             return {"success": False, "error": "No source files found"}
@@ -285,11 +304,12 @@ async def index_repo(
 
             files_to_parse = set(changed) | set(new)
             new_symbols = []
-            languages: dict[str, int] = {}
             raw_files_subset: dict[str, str] = {}
 
             for path in files_to_parse:
                 content = current_files[path]
+                # Track file hashes for changed/new files even when symbol extraction yields none.
+                raw_files_subset[path] = content
                 _, ext = os.path.splitext(path)
                 language = LANGUAGE_EXTENSIONS.get(ext)
                 if not language:
@@ -298,24 +318,23 @@ async def index_repo(
                     symbols = parse_file(content, path, language)
                     if symbols:
                         new_symbols.extend(symbols)
-                        raw_files_subset[path] = content
                 except Exception:
                     warnings.append(f"Failed to parse {path}")
 
             new_symbols = summarize_symbols(new_symbols, use_ai=use_ai_summaries)
 
-            # Compute language counts from all current files
-            for path in current_files:
-                _, ext = os.path.splitext(path)
-                lang = LANGUAGE_EXTENSIONS.get(ext)
-                if lang:
-                    languages[lang] = languages.get(lang, 0) + 1
+            # Generate file summaries for changed/new files
+            incr_symbols_map = defaultdict(list)
+            for s in new_symbols:
+                incr_symbols_map[s.file].append(s)
+            incr_file_summaries = generate_file_summaries(dict(incr_symbols_map))
 
             updated = store.incremental_save(
                 owner=owner, name=repo,
                 changed_files=changed, new_files=new, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
-                languages=languages,
+                languages={},
+                file_summaries=incr_file_summaries,
             )
 
             result = {
@@ -345,7 +364,8 @@ async def index_repo(
                 symbols = parse_file(content, path, language)
                 if symbols:
                     all_symbols.extend(symbols)
-                    languages[language] = languages.get(language, 0) + 1
+                    file_language = symbols[0].language or language
+                    languages[file_language] = languages.get(file_language, 0) + 1
                     raw_files[path] = content
                     parsed_files.append(path)
             except Exception:
@@ -358,14 +378,29 @@ async def index_repo(
         # Generate summaries
         all_symbols = summarize_symbols(all_symbols, use_ai=use_ai_summaries)
 
+        # Generate file-level summaries (single-pass grouping)
+        file_symbols_map = defaultdict(list)
+        for s in all_symbols:
+            file_symbols_map[s.file].append(s)
+        file_summaries = generate_file_summaries(dict(file_symbols_map))
+
+
         # Save index
+        # Track hashes for all discovered source files so incremental change detection
+        # does not repeatedly report no-symbol files as "new".
+        file_hashes = {
+            fp: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for fp, content in current_files.items()
+        }
         store.save_index(
             owner=owner,
             name=repo,
             source_files=parsed_files,
             symbols=all_symbols,
             raw_files=raw_files,
-            languages=languages
+            languages=languages,
+            file_hashes=file_hashes,
+            file_summaries=file_summaries,
         )
 
         result = {
@@ -374,6 +409,7 @@ async def index_repo(
             "indexed_at": store.load_index(owner, repo).indexed_at,
             "file_count": len(parsed_files),
             "symbol_count": len(all_symbols),
+            "file_summary_count": sum(1 for v in file_summaries.values() if v),
             "languages": languages,
             "files": parsed_files[:20],  # Limit files in response
         }
@@ -381,8 +417,8 @@ async def index_repo(
         if warnings:
             result["warnings"] = warnings
 
-        if len(source_files) >= 500:
-            result["warnings"] = warnings + ["Repository has many files; indexed first 500"]
+        if truncated:
+            result["warnings"] = warnings + [f"Repository has many files; indexed first {max_files}"]
 
         return result
     

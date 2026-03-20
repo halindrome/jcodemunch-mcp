@@ -1,5 +1,7 @@
 """Language registry with LanguageSpec definitions for all supported languages."""
 
+import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -61,7 +63,21 @@ LANGUAGE_EXTENSIONS = {
     ".dart": "dart",
     ".cs": "csharp",
     ".c": "c",
-    ".h": "c",
+    ".h": "cpp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".swift": "swift",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".rb": "ruby",
+    ".rake": "ruby",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".t": "perl",
 }
 
 
@@ -97,7 +113,6 @@ JAVASCRIPT_SPEC = LanguageSpec(
         "function_declaration": "function",
         "class_declaration": "class",
         "method_definition": "method",
-        "arrow_function": "function",
         "generator_function_declaration": "function",
     },
     name_fields={
@@ -126,7 +141,6 @@ TYPESCRIPT_SPEC = LanguageSpec(
         "function_declaration": "function",
         "class_declaration": "class",
         "method_definition": "method",
-        "arrow_function": "function",
         "interface_declaration": "type",
         "type_alias_declaration": "type",
         "enum_declaration": "type",
@@ -387,6 +401,147 @@ C_SPEC = LanguageSpec(
 )
 
 
+# Swift specification
+# Note: tree-sitter-swift uses class_declaration for class/struct/enum/extension;
+# the declaration_kind child field ("class"/"struct"/"enum"/"extension") disambiguates
+# at the source level but all map to "class" here for uniform treatment.
+# Attributes (@discardableResult etc.) live inside a modifiers child node rather
+# than as preceding siblings, so decorator extraction is not supported in this spec.
+SWIFT_SPEC = LanguageSpec(
+    ts_language="swift",
+    symbol_node_types={
+        "function_declaration": "function",
+        "class_declaration": "class",    # covers class, struct, enum, extension
+        "protocol_declaration": "type",
+        "init_declaration": "method",
+    },
+    name_fields={
+        "function_declaration": "name",  # simple_identifier child
+        "class_declaration": "name",     # type_identifier child
+        "protocol_declaration": "name",  # type_identifier child
+        "init_declaration": "name",      # "init" keyword token
+    },
+    param_fields={},  # Swift params are unnamed children; signature captured via source range
+    return_type_fields={},  # return type shares field "name" with function identifier
+    docstring_strategy="preceding_comment",  # /// and /* */ doc comments
+    decorator_node_type=None,
+    container_node_types=["class_declaration", "protocol_declaration"],
+    constant_patterns=["property_declaration"],  # let/var at file scope
+    type_patterns=["protocol_declaration"],
+)
+
+
+# C++ specification
+CPP_SPEC = LanguageSpec(
+    ts_language="cpp",
+    symbol_node_types={
+        "class_specifier": "class",
+        "struct_specifier": "type",
+        "union_specifier": "type",
+        "enum_specifier": "type",
+        "type_definition": "type",
+        "alias_declaration": "type",
+        "function_definition": "function",
+        "declaration": "function",
+        "field_declaration": "function",
+    },
+    name_fields={
+        "class_specifier": "name",
+        "struct_specifier": "name",
+        "union_specifier": "name",
+        "enum_specifier": "name",
+        "type_definition": "declarator",
+        "alias_declaration": "name",
+        "function_definition": "declarator",
+        "declaration": "declarator",
+        "field_declaration": "declarator",
+    },
+    param_fields={
+        "function_definition": "declarator",
+        "declaration": "declarator",
+        "field_declaration": "declarator",
+    },
+    return_type_fields={
+        "function_definition": "type",
+        "declaration": "type",
+        "field_declaration": "type",
+    },
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=["class_specifier", "struct_specifier", "union_specifier"],
+    constant_patterns=["preproc_def"],
+    type_patterns=["class_specifier", "struct_specifier", "union_specifier", "enum_specifier", "type_definition", "alias_declaration"],
+)
+
+
+# Elixir specification
+# NOTE: Elixir's tree-sitter grammar is homoiconic — all constructs (defmodule,
+# def, defp, defmacro, @doc, @type, etc.) are represented as generic `call` or
+# `unary_operator` nodes. Custom extraction is performed in extractor.py via
+# _parse_elixir_symbols(); the fields below are intentionally empty.
+ELIXIR_SPEC = LanguageSpec(
+    ts_language="elixir",
+    symbol_node_types={},
+    name_fields={},
+    param_fields={},
+    return_type_fields={},
+    docstring_strategy="elixir",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=[],
+    type_patterns=[],
+)
+
+
+# Perl specification
+PERL_SPEC = LanguageSpec(
+    ts_language="perl",
+    symbol_node_types={
+        "subroutine_declaration_statement": "function",
+        "package_statement": "class",
+    },
+    name_fields={
+        "subroutine_declaration_statement": "name",
+        "package_statement": "name",
+    },
+    param_fields={},
+    return_type_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=["use_statement"],
+    type_patterns=[],
+)
+
+
+# Ruby specification
+RUBY_SPEC = LanguageSpec(
+    ts_language="ruby",
+    symbol_node_types={
+        "method": "function",           # top-level → function; inside class/module → method
+        "singleton_method": "function", # def self.foo → always has class parent → method
+        "class": "class",
+        "module": "type",
+    },
+    name_fields={
+        "method": "name",
+        "singleton_method": "name",
+        "class": "name",
+        "module": "name",
+    },
+    param_fields={
+        "method": "parameters",
+        "singleton_method": "parameters",
+    },
+    return_type_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=["class", "module"],
+    constant_patterns=[],
+    type_patterns=["module"],
+)
+
+
 # Language registry
 LANGUAGE_REGISTRY = {
     "python": PYTHON_SPEC,
@@ -399,4 +554,38 @@ LANGUAGE_REGISTRY = {
     "dart": DART_SPEC,
     "csharp": CSHARP_SPEC,
     "c": C_SPEC,
+    "swift": SWIFT_SPEC,
+    "cpp": CPP_SPEC,
+    "elixir": ELIXIR_SPEC,
+    "ruby": RUBY_SPEC,
+    "perl": PERL_SPEC,
 }
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_extra_extensions() -> None:
+    """Apply JCODEMUNCH_EXTRA_EXTENSIONS env var to LANGUAGE_EXTENSIONS at import time."""
+    raw = os.environ.get("JCODEMUNCH_EXTRA_EXTENSIONS", "").strip()
+    if not raw:
+        return
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            logger.warning("JCODEMUNCH_EXTRA_EXTENSIONS: malformed entry %r (expected .ext:lang) — skipped", token)
+            continue
+        ext, _, lang = token.partition(":")
+        ext = ext.strip()
+        lang = lang.strip()
+        if not ext or not lang:
+            logger.warning("JCODEMUNCH_EXTRA_EXTENSIONS: malformed entry %r (empty ext or lang) — skipped", token)
+            continue
+        if lang not in LANGUAGE_REGISTRY:
+            logger.warning("JCODEMUNCH_EXTRA_EXTENSIONS: unknown language %r in entry %r — skipped", lang, token)
+            continue
+        LANGUAGE_EXTENSIONS[ext] = lang
+
+
+_apply_extra_extensions()

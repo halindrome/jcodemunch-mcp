@@ -13,7 +13,7 @@ from typing import Optional
 from ..parser.symbols import Symbol
 
 # Bump this when the index schema changes in an incompatible way.
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 
 
 def _file_hash(content: str) -> str:
@@ -49,7 +49,7 @@ class CodeIndex:
     index_version: int = INDEX_VERSION
     file_hashes: dict[str, str] = field(default_factory=dict)  # file_path -> sha256
     git_head: str = ""           # HEAD commit hash at index time (for git repos)
-    file_summaries: dict[str, str] = field(default_factory=dict)  # file_path -> summary (populated by #9)
+    file_summaries: dict[str, str] = field(default_factory=dict)  # file_path -> summary
 
     def get_symbol(self, symbol_id: str) -> Optional[dict]:
         """Find a symbol by ID."""
@@ -198,22 +198,9 @@ class IndexStore:
         languages: dict[str, int],
         file_hashes: Optional[dict[str, str]] = None,
         git_head: str = "",
+        file_summaries: Optional[dict[str, str]] = None,
     ) -> "CodeIndex":
-        """Save index and raw files to storage.
-
-        Args:
-            owner: Repository owner.
-            name: Repository name.
-            source_files: List of indexed file paths.
-            symbols: List of Symbol objects.
-            raw_files: Dict mapping file path to raw content.
-            languages: Dict mapping language to file count.
-            file_hashes: Optional precomputed {file_path: sha256} map.
-            git_head: Optional HEAD commit hash at index time.
-
-        Returns:
-            CodeIndex object.
-        """
+        """Save index and raw files to storage."""
         # Compute file hashes if not provided
         if file_hashes is None:
             file_hashes = {fp: _file_hash(content) for fp, content in raw_files.items()}
@@ -230,6 +217,7 @@ class IndexStore:
             index_version=INDEX_VERSION,
             file_hashes=file_hashes,
             git_head=git_head,
+            file_summaries=file_summaries or {},
         )
 
         # Save index JSON atomically: write to temp then rename
@@ -237,7 +225,6 @@ class IndexStore:
         tmp_path = index_path.with_suffix(".json.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self._index_to_dict(index), f, indent=2)
-        # Atomic rename (on POSIX; best-effort on Windows)
         tmp_path.replace(index_path)
 
         # Save raw files
@@ -280,13 +267,11 @@ class IndexStore:
             index_version=stored_version,
             file_hashes=data.get("file_hashes", {}),
             git_head=data.get("git_head", ""),
+            file_summaries=data.get("file_summaries", {}),
         )
 
     def get_symbol_content(self, owner: str, name: str, symbol_id: str) -> Optional[str]:
-        """Read symbol source using stored byte offsets.
-
-        This is O(1) - no re-parsing, just seek + read.
-        """
+        """Read symbol source using stored byte offsets."""
         index = self.load_index(owner, name)
         if not index:
             return None
@@ -314,19 +299,9 @@ class IndexStore:
         name: str,
         current_files: dict[str, str],
     ) -> tuple[list[str], list[str], list[str]]:
-        """Detect changed, new, and deleted files by comparing hashes.
-
-        Args:
-            owner: Repository owner.
-            name: Repository name.
-            current_files: Dict mapping file_path -> content for current state.
-
-        Returns:
-            Tuple of (changed_files, new_files, deleted_files).
-        """
+        """Detect changed, new, and deleted files by comparing hashes."""
         index = self.load_index(owner, name)
         if not index:
-            # No existing index: all files are new
             return [], list(current_files.keys()), []
 
         old_hashes = index.file_hashes
@@ -355,25 +330,12 @@ class IndexStore:
         raw_files: dict[str, str],
         languages: dict[str, int],
         git_head: str = "",
+        file_summaries: Optional[dict[str, str]] = None,
     ) -> Optional[CodeIndex]:
         """Incrementally update an existing index.
 
         Removes symbols for deleted/changed files, adds new symbols,
         updates raw content, and saves atomically.
-
-        Args:
-            owner: Repository owner.
-            name: Repository name.
-            changed_files: Files that changed (symbols will be replaced).
-            new_files: New files (symbols will be added).
-            deleted_files: Deleted files (symbols will be removed).
-            new_symbols: Symbols extracted from changed + new files.
-            raw_files: Raw content for changed + new files.
-            languages: Updated language counts.
-            git_head: Current HEAD commit hash.
-
-        Returns:
-            Updated CodeIndex, or None if no existing index.
         """
         index = self.load_index(owner, name)
         if not index:
@@ -385,6 +347,9 @@ class IndexStore:
 
         # Add new symbols
         all_symbols_dicts = kept_symbols + [self._symbol_to_dict(s) for s in new_symbols]
+        recomputed_languages = self._languages_from_symbols(all_symbols_dicts)
+        if not recomputed_languages and languages:
+            recomputed_languages = languages
 
         # Update source files list
         old_files = set(index.source_files)
@@ -402,6 +367,13 @@ class IndexStore:
         for fp, content in raw_files.items():
             file_hashes[fp] = _file_hash(content)
 
+        # Merge file summaries: keep old, remove deleted, update changed/new
+        merged_summaries = dict(index.file_summaries)
+        for f in deleted_files:
+            merged_summaries.pop(f, None)
+        if file_summaries:
+            merged_summaries.update(file_summaries)
+
         # Build updated index
         updated = CodeIndex(
             repo=f"{owner}/{name}",
@@ -409,11 +381,12 @@ class IndexStore:
             name=name,
             indexed_at=datetime.now().isoformat(),
             source_files=sorted(old_files),
-            languages=languages,
+            languages=recomputed_languages,
             symbols=all_symbols_dicts,
             index_version=INDEX_VERSION,
             file_hashes=file_hashes,
             git_head=git_head,
+            file_summaries=merged_summaries,
         )
 
         # Save atomically
@@ -445,6 +418,21 @@ class IndexStore:
                 f.write(content)
 
         return updated
+
+    def _languages_from_symbols(self, symbols: list[dict]) -> dict[str, int]:
+        """Compute language->file_count from serialized symbols."""
+        file_languages: dict[str, str] = {}
+        for sym in symbols:
+            file_path = sym.get("file")
+            language = sym.get("language")
+            if not file_path or not language:
+                continue
+            file_languages.setdefault(file_path, language)
+
+        counts: dict[str, int] = {}
+        for language in file_languages.values():
+            counts[language] = counts.get(language, 0) + 1
+        return counts
 
     def list_repos(self) -> list[dict]:
         """List all indexed repositories."""
@@ -520,4 +508,5 @@ class IndexStore:
             "index_version": index.index_version,
             "file_hashes": index.file_hashes,
             "git_head": index.git_head,
+            "file_summaries": index.file_summaries,
         }

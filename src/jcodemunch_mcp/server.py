@@ -11,6 +11,7 @@ from typing import Any, Optional
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+from . import __version__
 from .tools.index_repo import index_repo
 from .tools.index_folder import index_folder
 from .tools.list_repos import list_repos
@@ -114,7 +115,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "include_summaries": {
                         "type": "boolean",
-                        "description": "Include per-file summaries in the tree output",
+                        "description": "Include file-level summaries in the tree nodes",
                         "default": False
                     }
                 },
@@ -123,7 +124,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_file_outline",
-            description="Get all symbols (functions, classes, methods) in a file with signatures and summaries.",
+            description="Get all symbols (functions, classes, methods) in a file with signatures and summaries. Pass repo and file_path (e.g. 'src/main.py').",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -212,7 +213,7 @@ async def list_tools() -> list[Tool]:
                     "language": {
                         "type": "string",
                         "description": "Optional filter by language",
-                        "enum": ["python", "javascript", "typescript", "go", "rust", "java", "php", "dart", "csharp", "c"]
+                        "enum": ["python", "javascript", "typescript", "go", "rust", "java", "php", "dart", "csharp", "c", "cpp", "swift", "elixir", "ruby", "perl"]
                     },
                     "max_results": {
                         "type": "integer",
@@ -365,6 +366,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
     
+    except KeyError as e:
+        return [TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, indent=2))]
     except Exception as e:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
 
@@ -386,6 +389,12 @@ def main(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(
         prog="jcodemunch-mcp",
         description="Run the jCodeMunch MCP stdio server.",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--log-level",
@@ -414,6 +423,10 @@ def main(argv: Optional[list[str]] = None):
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=handlers,
     )
+
+    extra_ext = os.environ.get("JCODEMUNCH_EXTRA_EXTENSIONS", "")
+    if extra_ext:
+        logging.getLogger(__name__).info("JCODEMUNCH_EXTRA_EXTENSIONS: %s", extra_ext)
 
     asyncio.run(run_server())
 

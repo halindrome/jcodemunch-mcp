@@ -1,5 +1,6 @@
 """Index local folder tool - walk, parse, summarize, save."""
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -7,9 +8,12 @@ from typing import Optional
 
 import pathspec
 
+from collections import defaultdict
+
 logger = logging.getLogger(__name__)
 
 from ..parser import parse_file, LANGUAGE_EXTENSIONS
+from ..summarizer import generate_file_summaries
 from ..security import (
     validate_path,
     is_symlink_escape,
@@ -17,6 +21,7 @@ from ..security import (
     is_binary_file,
     should_exclude_file,
     DEFAULT_MAX_FILE_SIZE,
+    get_max_index_files,
 )
 from ..storage import IndexStore
 from ..summarizer import summarize_symbols
@@ -38,11 +43,16 @@ SKIP_PATTERNS = [
 
 def should_skip_file(path: str) -> bool:
     """Check if file should be skipped based on path patterns."""
-    # Normalize path separators for matching
     normalized = path.replace("\\", "/")
     for pattern in SKIP_PATTERNS:
-        if pattern in normalized:
-            return True
+        if pattern.endswith("/"):
+            # Directory pattern: match only complete path segments to avoid
+            # false positives on names like "rebuild/" or "proto-utils/"
+            if normalized.startswith(pattern) or ("/" + pattern) in normalized:
+                return True
+        else:
+            if pattern in normalized:
+                return True
     return False
 
 
@@ -60,7 +70,7 @@ def _load_gitignore(folder_path: Path) -> Optional[pathspec.PathSpec]:
 
 def discover_local_files(
     folder_path: Path,
-    max_files: int = 500,
+    max_files: Optional[int] = None,
     max_size: int = DEFAULT_MAX_FILE_SIZE,
     extra_ignore_patterns: Optional[list[str]] = None,
     follow_symlinks: bool = False,
@@ -77,6 +87,7 @@ def discover_local_files(
     Returns:
         Tuple of (list of Path objects for source files, list of warning strings).
     """
+    max_files = get_max_index_files(max_files)
     files = []
     warnings = []
     root = folder_path.resolve()
@@ -93,6 +104,7 @@ def discover_local_files(
         "too_large": 0,
         "unreadable": 0,
         "binary": 0,
+        "file_limit": 0,
     }
 
     # Load .gitignore
@@ -194,6 +206,7 @@ def discover_local_files(
 
     # File count limit with prioritization
     if len(files) > max_files:
+        skip_counts["file_limit"] = len(files) - max_files
         # Prioritize: src/, lib/, pkg/, cmd/, internal/ first
         priority_dirs = ["src/", "lib/", "pkg/", "cmd/", "internal/"]
 
@@ -247,11 +260,13 @@ def index_folder(
         return {"success": False, "error": f"Path is not a directory: {path}"}
 
     warnings = []
+    max_files = get_max_index_files()
 
     try:
         # Discover source files (with security filtering)
         source_files, discover_warnings, skip_counts = discover_local_files(
             folder_path,
+            max_files=max_files,
             extra_ignore_patterns=extra_ignore_patterns,
             follow_symlinks=follow_symlinks,
         )
@@ -301,12 +316,13 @@ def index_folder(
             # Parse only changed + new files
             files_to_parse = set(changed) | set(new)
             new_symbols = []
-            languages: dict[str, int] = {}
             raw_files_subset: dict[str, str] = {}
 
             incremental_no_symbols: list[str] = []
             for rel_path in files_to_parse:
                 content = current_files[rel_path]
+                # Track file hashes for changed/new files even when symbol extraction yields none.
+                raw_files_subset[rel_path] = content
                 ext = os.path.splitext(rel_path)[1]
                 language = LANGUAGE_EXTENSIONS.get(ext)
                 if not language:
@@ -315,7 +331,6 @@ def index_folder(
                     symbols = parse_file(content, rel_path, language)
                     if symbols:
                         new_symbols.extend(symbols)
-                        raw_files_subset[rel_path] = content
                     else:
                         incremental_no_symbols.append(rel_path)
                         logger.debug("NO SYMBOLS (incremental): %s", rel_path)
@@ -331,12 +346,11 @@ def index_folder(
 
             new_symbols = summarize_symbols(new_symbols, use_ai=use_ai_summaries)
 
-            # Compute updated language counts from all current files
-            for rel_path in current_files:
-                ext = os.path.splitext(rel_path)[1]
-                lang = LANGUAGE_EXTENSIONS.get(ext)
-                if lang:
-                    languages[lang] = languages.get(lang, 0) + 1
+            # Generate file summaries for changed/new files
+            incr_symbols_map = defaultdict(list)
+            for s in new_symbols:
+                incr_symbols_map[s.file].append(s)
+            incr_file_summaries = generate_file_summaries(dict(incr_symbols_map))
 
             from ..storage.index_store import _get_git_head
             git_head = _get_git_head(folder_path) or ""
@@ -345,7 +359,8 @@ def index_folder(
                 owner=owner, name=repo_name,
                 changed_files=changed, new_files=new, deleted_files=deleted,
                 new_symbols=new_symbols, raw_files=raw_files_subset,
-                languages=languages, git_head=git_head,
+                languages={}, git_head=git_head,
+                file_summaries=incr_file_summaries,
             )
 
             result = {
@@ -380,7 +395,8 @@ def index_folder(
                 symbols = parse_file(content, rel_path, language)
                 if symbols:
                     all_symbols.extend(symbols)
-                    languages[language] = languages.get(language, 0) + 1
+                    file_language = symbols[0].language or language
+                    languages[file_language] = languages.get(file_language, 0) + 1
                     raw_files[rel_path] = content
                     parsed_files.append(rel_path)
                 else:
@@ -403,14 +419,29 @@ def index_folder(
         # Generate summaries
         all_symbols = summarize_symbols(all_symbols, use_ai=use_ai_summaries)
 
+        # Generate file-level summaries (single-pass grouping)
+        file_symbols_map = defaultdict(list)
+        for s in all_symbols:
+            file_symbols_map[s.file].append(s)
+        file_summaries = generate_file_summaries(dict(file_symbols_map))
+
+
         # Save index
+        # Track hashes for all discovered source files so incremental change detection
+        # does not repeatedly report no-symbol files as "new".
+        file_hashes = {
+            fp: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for fp, content in current_files.items()
+        }
         store.save_index(
             owner=owner,
             name=repo_name,
             source_files=parsed_files,
             symbols=all_symbols,
             raw_files=raw_files,
-            languages=languages
+            languages=languages,
+            file_hashes=file_hashes,
+            file_summaries=file_summaries,
         )
 
         result = {
@@ -420,6 +451,7 @@ def index_folder(
             "indexed_at": store.load_index(owner, repo_name).indexed_at,
             "file_count": len(parsed_files),
             "symbol_count": len(all_symbols),
+            "file_summary_count": sum(1 for v in file_summaries.values() if v),
             "languages": languages,
             "files": parsed_files[:20],  # Limit files in response
             "discovery_skip_counts": skip_counts,
@@ -430,8 +462,8 @@ def index_folder(
         if warnings:
             result["warnings"] = warnings
 
-        if len(source_files) >= 500:
-            result["note"] = "Folder has many files; indexed first 500"
+        if skip_counts.get("file_limit", 0) > 0:
+            result["note"] = f"Folder has many files; indexed first {max_files}"
 
         return result
 

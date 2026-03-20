@@ -272,6 +272,68 @@ class TestPerLanguageExtraction:
         symbols = parse_file(content, fname, "csharp")
         record = _by_name(symbols, "Person")
         assert record.kind == "class"
+
+    # -- C++ -------------------------------------------------------------
+
+    def test_cpp_class(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        cls = _by_name(symbols, "Box")
+        assert cls.kind == "class"
+        assert "sample" in cls.qualified_name
+
+    def test_cpp_method_qualified_name(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        method = _by_name(symbols, "get")
+        assert method.kind == "method"
+        assert "Box" in method.qualified_name
+
+    def test_cpp_alias_and_enum(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        alias = _by_name(symbols, "UserId")
+        status = _by_name(symbols, "Status")
+        assert alias.kind == "type"
+        assert status.kind == "type"
+
+    def test_cpp_constant(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        const = _by_name(symbols, "MAX_USERS")
+        assert const.kind == "constant"
+
+    def test_cpp_overload_disambiguation(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        add_syms = [s for s in symbols if s.name == "add" and s.kind == "function"]
+        assert len(add_syms) >= 2
+        ids = [s.id for s in add_syms]
+        assert any(i.endswith("~1") for i in ids)
+        assert any(i.endswith("~2") for i in ids)
+
+    def test_cpp_nested_namespace_qualification(self):
+        content = """
+namespace a { namespace b {
+class Thing { public: int run() const { return 1; } };
+} }
+"""
+        symbols = parse_file(content, "ns.cpp", "cpp")
+        cls = _by_name(symbols, "Thing")
+        run = _by_name(symbols, "run")
+        assert cls.qualified_name == "a.b.Thing"
+        assert run.qualified_name == "a.b.Thing.run"
+
+    def test_cpp_mixed_header_deterministic(self):
+        content = """
+class MaybeCpp { public: int Get() const; };
+int only_c(void) { int v[] = (int[]){1,2,3}; return v[0]; }
+"""
+        run1 = parse_file(content, "mixed.h", "cpp")
+        run2 = parse_file(content, "mixed.h", "cpp")
+        assert run1 and run2
+        assert {s.language for s in run1} == {s.language for s in run2}
+
     # -- C ---------------------------------------------------------------
 
     def test_c_functions(self):
@@ -305,6 +367,123 @@ class TestPerLanguageExtraction:
         symbols = parse_file(content, fname, "c")
         auth = _by_name(symbols, "authenticate")
         assert auth.kind == "function"
+
+    # -- C++ --------------------------------------------------------------
+
+    def test_cpp_functions(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        grouped = _kinds(symbols)
+        func_names = {f.name for f in grouped.get("function", [])}
+        assert "identity" in func_names
+        assert "add" in func_names
+
+    def test_cpp_class(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        cls = _by_name(symbols, "Box")
+        assert cls.kind == "class"
+        assert "sample" in cls.qualified_name
+
+    def test_cpp_struct(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        alias = _by_name(symbols, "UserId")
+        assert alias.kind == "type"
+
+    def test_cpp_enum(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        status = _by_name(symbols, "Status")
+        assert status.kind == "type"
+
+    def test_cpp_constant(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        const = _by_name(symbols, "MAX_USERS")
+        assert const.kind == "constant"
+
+    def test_cpp_method_qualified_name(self):
+        content, fname = _fixture("cpp", "sample.cpp")
+        symbols = parse_file(content, fname, "cpp")
+        method = _by_name(symbols, "get")
+        assert method.kind == "method"
+        assert "Box" in method.qualified_name
+
+    # -- Elixir ----------------------------------------------------------
+
+    def test_elixir_module(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        mod = _by_name(symbols, "MyApp.Calculator")
+        assert mod.kind == "class"
+        assert mod.language == "elixir"
+
+    def test_elixir_method(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        method = _by_name(symbols, "add")
+        assert method.kind == "method"
+        assert method.parent is not None
+
+    def test_elixir_private_function(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        func = _by_name(symbols, "validate")
+        assert func.kind == "method"
+
+    def test_elixir_protocol(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        proto = _by_name(symbols, "MyApp.Printable")
+        assert proto.kind == "type"
+
+    def test_elixir_type_attribute(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        t = _by_name(symbols, "result")
+        assert t.kind == "type"
+
+    def test_elixir_qualified_names(self):
+        content, fname = _fixture("elixir", "sample.ex")
+        symbols = parse_file(content, fname, "elixir")
+        add = _by_name(symbols, "add")
+        assert add.qualified_name == "MyApp.Calculator.add"
+
+    # -- Ruby ------------------------------------------------------------
+
+    def test_ruby_class(self):
+        content, fname = _fixture("ruby", "sample.rb")
+        symbols = parse_file(content, fname, "ruby")
+        cls = _by_name(symbols, "User")
+        assert cls.kind == "class"
+        assert cls.language == "ruby"
+
+    def test_ruby_module(self):
+        content, fname = _fixture("ruby", "sample.rb")
+        symbols = parse_file(content, fname, "ruby")
+        mod = _by_name(symbols, "Serializable")
+        assert mod.kind == "type"
+
+    def test_ruby_method_qualified_name(self):
+        content, fname = _fixture("ruby", "sample.rb")
+        symbols = parse_file(content, fname, "ruby")
+        m = _by_name(symbols, "initialize")
+        assert m.qualified_name == "User.initialize"
+        assert m.kind == "method"
+
+    def test_ruby_singleton_method(self):
+        content, fname = _fixture("ruby", "sample.rb")
+        symbols = parse_file(content, fname, "ruby")
+        find = _by_name(symbols, "find")
+        assert find.kind == "method"
+        assert find.qualified_name == "User.find"
+
+    def test_ruby_top_level_function(self):
+        content, fname = _fixture("ruby", "sample.rb")
+        symbols = parse_file(content, fname, "ruby")
+        fmt = _by_name(symbols, "format_name")
+        assert fmt.kind == "function"
 
 
 # ===========================================================================
@@ -391,6 +570,9 @@ class TestDeterminism:
         ("dart", "sample.dart"),
         ("csharp", "sample.cs"),
         ("c", "sample.c"),
+        ("cpp", "sample.cpp"),
+        ("elixir", "sample.ex"),
+        ("ruby", "sample.rb"),
     ])
     def test_deterministic_ids_and_hashes(self, language, filename):
         content, fname = _fixture(language, filename)
@@ -542,7 +724,7 @@ class TestIndexVersioning:
         )
 
         assert index.index_version == INDEX_VERSION
-        assert index.index_version == 2
+        assert index.index_version == 3
 
     def test_load_preserves_version(self, tmp_path):
         store = IndexStore(base_path=str(tmp_path))
